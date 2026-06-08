@@ -1,0 +1,207 @@
+# UniTalk: Unified Speech-to-Avatar Conversational Modeling for Real-Time Interaction
+# ---------------------------------------------------------------------------
+# Inference configuration. Edit this file to point at your local checkpoints
+# and to tune runtime behavior. Paths are resolved relative to the UniTalk
+# project root (the directory containing the `unitalk/` package).
+
+
+# This is the best version 0.1
+
+project:
+  name: UniTalk
+  description: Unified Speech-to-Avatar Conversational Modeling for Real-Time Interaction
+  version: "1.0"
+
+# ── Filesystem paths ─────────────────────────────────────────────────────
+# All paths are relative to the project root unless absolute.
+#
+# Rotate-mode note:
+#   When `static_index` ends with `flashtalk_head_rotate.html`, the server
+#   will automatically pad `ref_image` to a square + resize to 512x512 and
+#   feed the resulting PNG to the model. The browser receives the
+#   crop geometry and strips the padding back out before display +
+#   recording, so the final video keeps the ref image's original aspect
+#   ratio. For all other static_index values, no preprocessing happens —
+#   pass in an already-square 512x512 image yourself.
+paths:
+  soulx_root: SoulX-FlashHead
+  moshi_pkg: moshi/moshi
+  flash_ckpt: SoulX-FlashHead/models/SoulX-FlashHead-1_3B
+  flash_wav2vec: SoulX-FlashHead/models/wav2vec2-base-960h
+  ref_image: examples/rb3.jpg
+  # Explicit adapter override. Leave null to fall back to the active
+  # engine's default_adapter_path (see moshi.default_adapter_path /
+  # personaplex.default_adapter_path below). Either takes precedence over
+  # the engine default; CLI --adapter-ckpt-path beats both.
+  adapter_ckpt_path: null
+  static_dir: unitalk/static
+  static_index: unitalk/static/flashtalk_head_rotate.html
+
+# ── S2S engine selection ─────────────────────────────────────────────────
+# Top-level switch for which speech-to-speech model the server loads.
+# CLI: --s2s-engine moshi|personaplex
+s2s:
+  engine: moshi              # moshi | personaplex
+
+# ── HTTP / WebSocket server ──────────────────────────────────────────────
+server:
+  host: 0.0.0.0
+  port: 7860
+  show_sync: false
+
+# ── Moshi Helium S2S model ───────────────────────────────────────────────
+# Active when s2s.engine == "moshi".
+moshi:
+  precision: bf16              # one of: q8, bf16, fp32
+  repo_override: null          # null = use preset's default HF repo
+  device: auto                 # auto | cuda | cpu
+  # ── Adapter loaded when paths.adapter_ckpt_path is null ───────────
+  # CLI --adapter-ckpt-path beats both this default and the YAML field.
+  #
+  # Files in checkpoints/moshi_to_adapter/ produced by the training
+  # pipeline (always engine + flashhead + phase in the name):
+  #   moshi_to_flashhead_phase1_best.pt    ← Phase 1 final best (default)
+  #   moshi_to_flashhead_phase1_latest.pt  ← Phase 1 latest epoch
+  #   moshi_to_flashhead_phase1_ep{N}.pt   ← Phase 1 top-3 epoch history
+  #   moshi_to_flashhead_phase2_best.pt    ← Phase 2 final  (HIGHEST QUALITY)
+  #   moshi_to_flashhead_phase2_latest.pt  ← Phase 2 latest epoch
+  #   moshi_to_flashhead_phase2_ep{N}.pt   ← Phase 2 top-3 epoch history
+  #   moshi_to_flashhead_phase2_step{N}.pt ← Phase 2 mid-training (crash recovery)
+  #
+  # Recommendation: when Phase 2 has been trained, point this at the
+  # phase2_best file (it always lip-syncs better than phase1_best).
+  # Default points at phase1_best for safety — if Phase 2 hasn't been
+  # trained yet, phase1_best is what's available. The resolver will
+  # also auto-upgrade to phase2_best when present, if you leave the
+  # default as-is.
+  default_adapter_path: checkpoints/moshi_to_adapter/moshi_to_flashhead_phase1_best.pt
+  presets:
+    q8:   { repo: "kyutai/moshiko-pytorch-q8",   dtype: bfloat16 }
+    bf16: { repo: "kyutai/moshiko-pytorch-bf16", dtype: bfloat16 }
+    fp32: { repo: "kyutai/moshiko-pytorch-bf16", dtype: float32  }
+
+# ── PersonaPlex S2S model ────────────────────────────────────────────────
+# Active when s2s.engine == "personaplex". This is NVIDIA's finetune of
+# Moshi Helium that adds a persona text prompt and voice-clone audio
+# prompt. Both are optional — leaving them null gives a default-persona
+# run.
+#
+# Voice prompts (.pt) live in assets/audio_prompts/ — top-level, owned
+# by us, single .gitignore rule. .wav files also work; the engine
+# LUFS-normalizes + mimi-encodes them on load (slower startup but lets
+# you clone any voice). Bundled voices (NATF*/NATM*/VARF*/VARM*) auto-
+# download from HF on first launch if the file is missing.
+#
+# Text prompt is wrapped <system> {text} <system> by the engine before
+# tokenization, matching PersonaPlex's own server.py.
+personaplex:
+  precision: bf16
+  repo_override: null
+  device: auto
+  pkg_path: personaplex/moshi             # path to inner package (verified)
+  voice_prompt: assets/audio_prompts/NATM0.pt
+  text_prompt: "You are a helpful assistant. Respond naturally and concisely."
+  # ── Adapter loaded when paths.adapter_ckpt_path is null ───────────
+  # Files in checkpoints/personaplex_to_adapter/ produced by the
+  # training pipeline (always engine + flashhead + phase in the name):
+  #   personaplex_to_flashhead_phase1_best.pt    ← Phase 1 final best (default)
+  #   personaplex_to_flashhead_phase1_latest.pt  ← Phase 1 latest epoch
+  #   personaplex_to_flashhead_phase1_ep{N}.pt   ← Phase 1 top-3 epoch history
+  #   personaplex_to_flashhead_phase2_best.pt    ← Phase 2 final  (HIGHEST QUALITY)
+  #   personaplex_to_flashhead_phase2_latest.pt  ← Phase 2 latest
+  #   personaplex_to_flashhead_phase2_ep{N}.pt   ← Phase 2 top-3 epoch history
+  #   personaplex_to_flashhead_phase2_step{N}.pt ← Phase 2 mid-training
+  #
+  # Recommendation: point this at phase2_best once Phase 2 is trained.
+  # The resolver also auto-upgrades to phase2 if it finds it.
+  default_adapter_path: checkpoints/personaplex_to_adapter/personaplex_to_flashhead_phase1_best.pt
+  presets:
+    bf16: { repo: "nvidia/personaplex-7b-v1", dtype: bfloat16 }
+
+# ── SoulX-FlashHead avatar pipeline ──────────────────────────────────────
+# Adaptive warmup: the loop runs at least `warmup_min_chunks` chunks (the
+# first is always slow due to torch.compile JIT), then keeps going until
+# two consecutive chunks are within ±15% of each other AND under
+# `warmup_target_ms_per_frame`, capped by `warmup_max_chunks`.
+#
+# Internally the loop runs a short "silence" pass first (1-2 zero-deque
+# chunks) and then switches to a Gaussian random-token deque so the
+# adapter + DiT exercise the same kernels live conversation hits. This
+# costs ~1-2s more startup but guarantees the first real chunk in the
+# session is already at steady-state speed (the zero-deque path used to
+# converge in 2 chunks but the first live chunk was 4-5× slower).
+flashhead:
+  model_type: lite                 # lite (~350ms/chunk) | pro (~600ms/chunk)
+  base_seed: 42
+  warmup_min_chunks: 3             # always run at least this many
+  warmup_max_chunks: 12            # never exceed this many (safety cap)
+  warmup_target_ms_per_frame: 30   # tighter than 40ms (real-time) to leave
+                                   # headroom for JPEG encode + WebSocket
+                                   # send + browser decode (~5-10ms total).
+                                   # 30ms/frame ≈ 33fps generation, which
+                                   # keeps the dispatch queue ahead of the
+                                   # 25fps display rate.
+  device: auto                     # auto | cuda | cpu
+
+# ── Internal queue sizes (advanced; rarely changed) ──────────────────────
+# Note: the client-side startup buffer is fully DYNAMIC — playback starts
+# the moment the first chunk arrives, regardless of model variant. No
+# fixed wait. The old `buffer_latency_ms` block was removed because it
+# was unused (only displayed in legacy telemetry).
+queues:
+  token_max: 200
+  dispatch_max: 4
+  mic_max: 48
+
+# ── Barge-in / interruption VAD ──────────────────────────────────────────
+# Server-side Silero VAD that listens to the incoming mic stream. When it
+# detects the user starting a new turn, the session purges the token and
+# dispatch queues and tells the client to stop the currently-scheduled
+# audio + clear the frame buffer. The user perceives a sub-300 ms cutoff
+# instead of waiting for ~2 s of pipeline drain.
+#
+# Tuning notes:
+#   speech_threshold:   raise (0.6-0.7) in noisy environments, lower (0.3-0.4)
+#                       for soft-spoken users. 0.5 is Silero's default.
+#   min_speech_frames:  number of consecutive 32 ms windows of speech needed
+#                       to fire. Lower = faster trigger but more false positives.
+#                       2 → 64 ms (snappy). 3-4 if you get spurious fires.
+#   min_silence_frames: silence windows needed to consider the user turn done
+#                       and re-arm the detector. 16 → 512 ms (allows in-sentence
+#                       pauses without re-firing).
+#   cooldown_ms:        hard floor on interval between two consecutive
+#                       interrupts. Prevents flicker.
+vad:
+  enabled: true
+  # Probability ≥ this is "speech". Silero's default is 0.5; raise to
+  # 0.6-0.7 for noisy rooms or speaker-bleed scenarios.
+  speech_threshold: 0.5
+  # Number of consecutive 32 ms windows above threshold before mute fires.
+  # 4 → 128 ms of real speech. This filters lip smacks, breaths, and
+  # brief noise bursts that 2-frame (64 ms) would have fired on.
+  min_speech_frames: 4
+  # Number of consecutive 32 ms windows of silence before unmute.
+  # 25 → 800 ms. Gives natural mid-sentence pauses without re-firing.
+  # Drop to 16-18 (~520-580 ms) if the avatar takes too long to respond
+  # after you finish speaking.
+  min_silence_frames: 25
+  cooldown_ms: 800.0
+
+# ── Background keep-warm loop (opt-in) ───────────────────────────────────
+# When enabled, a daemon thread runs one silent FlashHead chunk every
+# `interval_s` seconds while no client session is active. This keeps the
+# DiT + adapter CUDA kernels hot so the FIRST chunk after the user clicks
+# "Start Conversation" arrives at steady-state speed instead of paying
+# any cache-cooldown penalty.
+#
+# Cost: ~200 ms of GPU per tick. On a B200 / 5090 this is ~4% duty cycle
+# at the default 5s interval — negligible compared to a full session.
+# Disable on shared GPUs or when you'd rather not have any idle activity.
+#
+# The loop coordinates with active sessions via a shared lock — it can
+# never overlap with real chunk generation, and a brand-new session
+# will wait at most one tick (~200ms) for any in-flight keepwarm chunk
+# to finish before proceeding.
+keepwarm:
+  enabled: false        # set true to opt in
+  interval_s: 5.0       # one keepwarm chunk every N seconds while idle
