@@ -4,7 +4,7 @@
 
 Replaces the Wav2Vec2 audio encoder with Moshi's Mimi codec + LM and
 the trained MoshiToWav2VecAdapter, so you can drive SoulX-FlashHead from
-any WAV / MP3 / FLAC file without needing wav2vec2 for audio encoding.
+any WAV / MP3 / FLAC file without needing Wav2Vec2 for audio encoding.
 
 Pipeline
 --------
@@ -13,7 +13,7 @@ Pipeline
 2.  Sliding deque (8-second window, 100 tokens)
 3.  ``get_audio_embedding_from_tokens(adapter, deque, frame_num, ...)``
         [100, 4096] → interpolate → adapter → windowed context
-        → [1, frame_num, 5, 12, 768]  (same shape as wav2vec2 path)
+        → [1, frame_num, 5, 12, 768]  (same shape as Wav2Vec2 path)
 4.  ``run_pipeline(pipeline, audio_emb)``
         DiT denoising (4 steps) + VAE decode → [frame_num, H, W, 3]
 5.  Concatenate chunks, mux with original audio, save MP4.
@@ -23,16 +23,19 @@ Usage
 ::
 
     python generate_video_adapter.py \\
-        --ckpt_dir      models/SoulX-FlashHead-1_3B \\
-        --wav2vec_dir   models/wav2vec2-base-960h \\
+        --soulx_root    /workspace/SoulX-FlashHead \\
+        --ckpt_dir      /workspace/SoulX-FlashHead/models/SoulX-FlashHead-1_3B \\
+        --wav2vec_dir   /workspace/SoulX-FlashHead/models/wav2vec2-base-960h \\
         --model_type    lite \\
-        --cond_image    examples/girl.png \\
-        --audio_path    examples/podcast_sichuan_16k.wav \\
-        --adapter_ckpt  ../checkpoints/moshi_to_adapter/moshi_to_flashhead_phase1_best.pt \\
-        --moshi_pkg     ../moshi/moshi
+        --cond_image    /workspace/SoulX-FlashHead/examples/girl.png \\
+        --audio_path    /workspace/SoulX-FlashHead/examples/podcast_sichuan_16k.wav \\
+        --adapter_ckpt  /workspace/merge-soul-n-uni/checkpoints/moshi_to_adapter/moshi_to_flashhead_phase1_best.pt \\
+        --moshi_pkg     /workspace/merge-soul-n-uni/moshi/moshi
 
-Note: ``--wav2vec_dir`` is still required because FlashHeadPipeline loads the
-Wav2Vec2 model at init (it is not used for audio encoding in adapter mode).
+``--soulx_root`` points to the SoulX-FlashHead root directory that contains
+``flash_head/``.  If omitted it defaults to the directory containing this
+script (for development) or tries ``/workspace/SoulX-FlashHead`` (RunPod
+default).
 """
 
 from __future__ import annotations
@@ -51,13 +54,12 @@ import numpy as np
 import torch
 from loguru import logger
 
-# ── Make both flash_head/ (SoulX) and unitalk/ importable ─────────────────
-_HERE = os.path.dirname(os.path.abspath(__file__))         # SoulX-FlashHead-original/
-_PROJECT_ROOT = os.path.dirname(_HERE)                      # merge-soul-n-uni/
+# ── unitalk/ must be importable ────────────────────────────────────────────
+_SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))  # .../SoulX-FlashHead-original/
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)                # .../merge-soul-n-uni/
 
-for _p in (_HERE, _PROJECT_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -69,12 +71,20 @@ def _parse_args() -> argparse.Namespace:
         description="Generate talking-head video using the UniTalk adapter",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # ── SoulX ──
+    # ── SoulX root ──
+    p.add_argument(
+        "--soulx_root", default=None,
+        help="Path to the SoulX-FlashHead root (the directory that contains "
+             "flash_head/).  Defaults to /workspace/SoulX-FlashHead on RunPod "
+             "or the directory containing this script for local development.",
+    )
+    # ── SoulX model paths ──
     p.add_argument("--ckpt_dir",    required=True,
                    help="SoulX-FlashHead-1_3B checkpoint directory")
     p.add_argument("--wav2vec_dir", required=True,
-                   help="wav2vec2-base-960h directory (loaded by pipeline; "
-                        "not used for audio encoding in adapter mode)")
+                   help="wav2vec2-base-960h directory (still loaded by the "
+                        "pipeline at init; not used for audio encoding in "
+                        "adapter mode)")
     p.add_argument("--model_type",  required=True, choices=["lite", "pro"],
                    help="Model variant")
     p.add_argument("--cond_image",  required=True,
@@ -87,7 +97,7 @@ def _parse_args() -> argparse.Namespace:
     # ── Moshi encoder ──
     p.add_argument("--moshi_pkg",  default=None,
                    help="Path to the Moshi inner package directory "
-                        "(the parent of the moshi/ Python package). "
+                        "(parent of the moshi/ Python package). "
                         "Defaults to <project_root>/moshi/moshi")
     p.add_argument("--moshi_repo", default="kyutai/moshiko-pytorch-bf16",
                    help="HuggingFace repo ID for the Moshi checkpoint")
@@ -100,6 +110,27 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--device",      default="cuda",
                    help="PyTorch device")
     return p.parse_args()
+
+
+def _resolve_soulx_root(args_soulx_root: str | None) -> str:
+    """Return the best available SoulX root directory."""
+    candidates = []
+    if args_soulx_root:
+        candidates.append(os.path.abspath(args_soulx_root))
+    # RunPod: original notebook clones to /workspace/SoulX-FlashHead
+    candidates.append("/workspace/SoulX-FlashHead")
+    # Side-by-side clone next to merge-soul-n-uni
+    candidates.append(os.path.join(os.path.dirname(_PROJECT_ROOT), "SoulX-FlashHead"))
+    # This script's own directory (development mode)
+    candidates.append(_SCRIPT_DIR)
+
+    for candidate in candidates:
+        fh = os.path.join(candidate, "flash_head")
+        if os.path.isdir(fh):
+            return candidate
+
+    # Fallback — let ensure_flashhead_imports raise a clear error
+    return candidates[0] if candidates else _SCRIPT_DIR
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -140,7 +171,10 @@ def save_video(
 def main() -> None:
     args = _parse_args()
 
-    # ── 0. Resolve paths ──────────────────────────────────────────────────
+    # ── 0. Resolve all paths ──────────────────────────────────────────────
+    soulx_root = _resolve_soulx_root(args.soulx_root)
+    logger.info(f"SoulX root: {soulx_root}")
+
     if args.moshi_pkg is None:
         args.moshi_pkg = os.path.join(_PROJECT_ROOT, "moshi", "moshi")
 
@@ -150,13 +184,17 @@ def main() -> None:
     args.cond_image   = os.path.abspath(args.cond_image)
     args.audio_path   = os.path.abspath(args.audio_path)
 
-    # ── 1. Load SoulX-FlashHead pipeline ─────────────────────────────────
-    # flash_head/configs/infer_params.yaml is read relative to CWD at import
-    # time, so we must chdir into the SoulX root before importing.
-    os.chdir(_HERE)
-    from flash_head.inference import (
-        get_pipeline, get_base_data, get_infer_params, run_pipeline,
-    )
+    # ── 1. Load SoulX-FlashHead pipeline via unitalk's import helper ──────
+    # ensure_flashhead_imports handles sys.path + chdir so flash_head/ is
+    # always found from the correct SoulX root, regardless of where this
+    # script lives.
+    from unitalk.utils import ensure_flashhead_imports
+    fh = ensure_flashhead_imports(soulx_root)
+
+    get_pipeline      = fh["get_pipeline"]
+    get_base_data     = fh["get_base_data"]
+    get_infer_params  = fh["get_infer_params"]
+    run_pipeline      = fh["run_pipeline"]
 
     logger.info("Loading SoulX-FlashHead pipeline (DiT + VAE + Wav2Vec2)...")
     pipeline = get_pipeline(
@@ -221,12 +259,10 @@ def main() -> None:
     # Each video slice corresponds to `slice_len` frames at 25 fps = slice_len×40ms.
     # Moshi runs at 12.5 Hz (one token per 80 ms), so:
     #   tokens_per_chunk = slice_len × 40ms / 80ms = slice_len / 2
-    #
     #   Lite: slice_len=24 → tokens_per_chunk=12  (12 × 80ms = 960ms of audio)
     #   Pro:  slice_len=28 → tokens_per_chunk=14  (14 × 80ms = 1120ms of audio)
     tokens_per_chunk = slice_len // 2
 
-    # Total number of chunks (pad last chunk with silence if audio runs short).
     n_chunks = max(1, math.ceil(N_total / tokens_per_chunk))
 
     # Deque initialised with silence (zeros), FIFO of the last 8 s of tokens.
@@ -237,25 +273,24 @@ def main() -> None:
     generated: list[torch.Tensor] = []
 
     logger.info(
-        f"Generating video: {N_total} tokens @ {12.5} Hz "
+        f"Generating video: {N_total} tokens @ 12.5 Hz "
         f"({N_total / 12.5:.1f}s audio) → "
         f"{n_chunks} chunks × {slice_len} frames "
         f"({n_chunks * slice_len / tgt_fps:.1f}s video)"
     )
 
     for chunk_idx in range(n_chunks):
-        # Slide deque forward by tokens_per_chunk new tokens (or silence).
+        # Slide deque forward by tokens_per_chunk new tokens (or silence if
+        # the audio ended before the last chunk).
         start = chunk_idx * tokens_per_chunk
         end   = min(start + tokens_per_chunk, N_total)
         for tok in all_tokens[start:end]:
             token_deque.append(tok)
-        # Pad remaining slots with silence if audio exhausted before end.
-        for _ in range(tokens_per_chunk - (end - start)):
+        for _ in range(tokens_per_chunk - (end - start)):   # silence padding
             token_deque.append(torch.zeros(MOSHI_DIM))
 
-        # Snapshot → [DEQUE_SIZE, 4096] on CPU; get_audio_embedding_from_tokens
-        # will move it to device internally.
-        snap = torch.stack(list(token_deque), dim=0)   # [100, 4096]
+        # Snapshot → [DEQUE_SIZE, 4096] on CPU.
+        snap = torch.stack(list(token_deque), dim=0)
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -268,8 +303,7 @@ def main() -> None:
             )
             video = run_pipeline(pipeline, audio_emb)
 
-        # Discard motion-carry frames (streaming mode — always skip, same as
-        # generate_video.py's audio_encode_mode='stream' behaviour).
+        # Discard motion-carry frames (streaming mode).
         video = video[motion_frames_num:]
 
         torch.cuda.synchronize()
@@ -284,7 +318,7 @@ def main() -> None:
 
     # ── 5. Save MP4 ───────────────────────────────────────────────────────
     if args.save_file is None:
-        out_dir = os.path.join(_HERE, "sample_results")
+        out_dir = os.path.join(_SCRIPT_DIR, "sample_results")
         os.makedirs(out_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         args.save_file = os.path.join(out_dir, f"res_adapter_{ts}.mp4")
